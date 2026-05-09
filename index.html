@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Finance Agent</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#09090d;min-height:100vh}
+  textarea{field-sizing:content}
+  ::-webkit-scrollbar{width:4px}
+  ::-webkit-scrollbar-track{background:#09090d}
+  ::-webkit-scrollbar-thumb{background:rgba(184,132,58,0.3);border-radius:4px}
+  @keyframes dot{0%,100%{opacity:.3;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+  details>summary{list-style:none}
+  details>summary::-webkit-details-marker{display:none}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ── CONFIG : mettez votre clé API ici pour éviter de la saisir à chaque fois ── */
+const DEFAULT_API_KEY = ""; // ex: "sk-ant-api03-..."
+
+const G = {
+  bg:"#09090d", surface:"#111318", surface2:"#181c24", surface3:"#1e2330",
+  gold:"#b8843a", goldBright:"#d4a855", goldDim:"rgba(184,132,58,0.18)",
+  goldBorder:"rgba(184,132,58,0.25)", cream:"#ede7d5", muted:"#6b6450",
+  border:"rgba(255,255,255,0.06)", mono:"'Courier New',monospace",
+  sans:"system-ui,-apple-system,sans-serif", serif:"Georgia,serif",
+};
+
+function buildSystem(portfolio) {
+  let sys = `You are an expert private finance advisor. Help with portfolio analysis, stocks, ETFs, asset allocation, risk management, budgeting, retirement, and tax strategies. Be direct, specific, use bullet points. Note when a licensed advisor is needed.`;
+  if (portfolio?.type === "xls" && portfolio.textData)
+    sys += `\n\nUSER PORTFOLIO DATA:\n${portfolio.textData}\n\nGive personalized, specific advice referencing actual positions.`;
+  else if (portfolio?.type === "image")
+    sys += `\n\nThe user shared a portfolio image — you'll receive it with the first message. Analyze it carefully.`;
+  return sys;
+}
+
+function parseXLS(file) {
+  return new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+        const noEmpty = rows.filter(r => r.some(c => c !== ""));
+        res({ rows: noEmpty, text: noEmpty.map(r => r.join(" | ")).join("\n"), sheetName: wb.SheetNames[0] });
+      } catch(err){ rej(err); }
+    };
+    reader.onerror = rej;
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function toBase64(file) {
+  return new Promise((res, rej) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const b64 = e.target.result.split(",")[1];
+      res({ b64, mediaType: file.type });
+    };
+    reader.onerror = rej;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function callClaude({ messages, system, portfolio, apiKey }) {
+  const apiMessages = messages.map((m, i) => {
+    if (i === 0 && portfolio?.type === "image" && portfolio.b64)
+      return { role:"user", content:[
+        { type:"image", source:{ type:"base64", media_type:portfolio.mediaType, data:portfolio.b64 }},
+        { type:"text", text:m.content }
+      ]};
+    return { role:m.role, content:m.content };
+  });
+  const headers = { "Content-Type":"application/json" };
+  if (apiKey) headers["x-api-key"] = apiKey;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST", headers,
+    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1000, system, messages:apiMessages })
+  });
+  if (!res.ok) { const e = await res.json().catch(()=>({})); throw new Error(e?.error?.message || `HTTP ${res.status}`); }
+  const data = await res.json();
+  return data.content?.map(b=>b.text||"").join("") || "";
+}
+
+const QUICK_NONE = [
+  {icon:"📊",text:"Analyse mon allocation d'actifs pour la diversification"},
+  {icon:"💰",text:"Quelle stratégie pour investir 10 000 € sur le long terme ?"},
+  {icon:"📈",text:"ETF vs actions individuelles : avantages et risques"},
+  {icon:"🏦",text:"Comment optimiser la fiscalité sur mes plus-values ?"},
+];
+const QUICK_PORT = [
+  {icon:"🔍",text:"Analyse mon portfolio et donne tes observations clés"},
+  {icon:"⚖️",text:"Mon portfolio est-il bien diversifié ? Que changer ?"},
+  {icon:"📉",text:"Quels sont les risques principaux de mon portfolio ?"},
+  {icon:"🎯",text:"Suggère des ajustements pour optimiser le rendement/risque"},
+];
+
+/* ── SETUP ── */
+function SetupPage({ onStart }) {
+  const [portfolio, setPortfolio] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [apiKey, setApiKey] = useState(DEFAULT_API_KEY);
+  const [showKey, setShowKey] = useState(false);
+  const [sessionName, setSessionName] = useState("");
+  const fileRef = useRef();
+
+  const handleFile = useCallback(async (file) => {
+    if (!file) return;
+    setError(null); setLoading(true);
+    try {
+      const ext = file.name.split(".").pop().toLowerCase();
+      if (["xls","xlsx","csv"].includes(ext)) {
+        const r = await parseXLS(file);
+        setPortfolio({ type:"xls", rows:r.rows, textData:r.text, sheetName:r.sheetName, fileName:file.name });
+      } else if (file.type.startsWith("image/")) {
+        const { b64, mediaType } = await toBase64(file);
+        setPortfolio({ type:"image", b64, mediaType, previewUrl:URL.createObjectURL(file), fileName:file.name });
+      } else setError("Format non supporté. Utilisez Excel, CSV ou une image.");
+    } catch { setError("Erreur de lecture. Réessayez."); }
+    setLoading(false);
+  }, []);
+
+  const onDrop = (e) => { e.preventDefault(); setDragging(false); handleFile(e.dataTransfer.files[0]); };
+
+  const ib = (extra) => ({ width:"100%", background:G.surface, border:`1px solid ${G.border}`, borderRadius:10, color:G.cream, fontSize:14, padding:"12px 16px", outline:"none", fontFamily:G.sans, ...extra });
+
+  return (
+    <div style={{ minHeight:"100vh", background:G.bg, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"2rem 1.5rem", fontFamily:G.sans, color:G.cream }}>
+      <div style={{ marginBottom:"3rem", textAlign:"center" }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, marginBottom:8 }}>
+          <div style={{ width:44, height:44, borderRadius:"50%", background:`linear-gradient(135deg,${G.gold},${G.goldBright})`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:22, color:"#fff", fontFamily:G.serif }}>₣</div>
+          <span style={{ fontSize:22, fontWeight:700, fontFamily:G.serif, color:G.cream }}>Finance Agent</span>
+        </div>
+        <p style={{ color:G.muted, fontSize:12, letterSpacing:"0.12em", textTransform:"uppercase" }}>Session personnalisée</p>
+      </div>
+
+      <div style={{ width:"100%", maxWidth:540 }}>
+        {/* Session name */}
+        <div style={{ marginBottom:18 }}>
+          <label style={{ display:"block", fontSize:11, letterSpacing:"0.12em", textTransform:"uppercase", color:G.muted, marginBottom:8 }}>Nom de la session (optionnel)</label>
+          <input value={sessionName} onChange={e=>setSessionName(e.target.value)} placeholder="Ex: Portfolio 2025…" style={ib({})} onFocus={e=>e.target.style.borderColor=G.goldBorder} onBlur={e=>e.target.style.borderColor=G.border}/>
+        </div>
+
+        {/* Upload */}
+        <div style={{ marginBottom:18 }}>
+          <label style={{ display:"block", fontSize:11, letterSpacing:"0.12em", textTransform:"uppercase", color:G.muted, marginBottom:8 }}>Portfolio (optionnel)</label>
+          <div
+            onDrop={onDrop}
+            onDragOver={e=>{e.preventDefault();setDragging(true)}}
+            onDragLeave={()=>setDragging(false)}
+            onClick={()=>!portfolio&&fileRef.current?.click()}
+            style={{ border:`1.5px dashed ${dragging?G.goldBright:portfolio?G.goldBorder:G.border}`, borderRadius:14, padding:portfolio?"16px":"40px 24px", background:dragging?G.goldDim:G.surface, cursor:portfolio?"default":"pointer", transition:"all .15s", textAlign:portfolio?"left":"center" }}
+          >
+            {loading && <div style={{textAlign:"center",color:G.muted,fontSize:13}}>⏳ Chargement…</div>}
+            {!loading && !portfolio && (
+              <>
+                <div style={{fontSize:28,marginBottom:10}}>📂</div>
+                <p style={{marginBottom:6,fontSize:14,color:G.cream}}>Glissez votre fichier portfolio ici</p>
+                <p style={{fontSize:12,color:G.muted}}>Excel .xlsx · .xls · CSV · Image screenshot</p>
+                <div style={{marginTop:14,display:"inline-block",padding:"8px 20px",background:G.surface2,border:`1px solid ${G.goldBorder}`,borderRadius:8,fontSize:12,color:G.gold}}>Choisir un fichier</div>
+              </>
+            )}
+            {!loading && portfolio?.type==="xls" && (
+              <div>
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                  <span style={{fontSize:20}}>📊</span>
+                  <div style={{flex:1}}>
+                    <p style={{margin:0,fontSize:13,fontWeight:600,color:G.cream}}>{portfolio.fileName}</p>
+                    <p style={{margin:0,fontSize:11,color:G.muted}}>{portfolio.sheetName} · {portfolio.rows.length} lignes</p>
+                  </div>
+                  <button onClick={()=>setPortfolio(null)} style={{background:"transparent",border:`1px solid ${G.border}`,borderRadius:6,color:G.muted,fontSize:11,padding:"4px 10px",cursor:"pointer"}}>Retirer</button>
+                </div>
+                <div style={{overflowX:"auto",borderRadius:8,border:`1px solid ${G.border}`,maxHeight:180,overflowY:"auto"}}>
+                  <table style={{borderCollapse:"collapse",width:"100%",fontFamily:G.mono,fontSize:11}}>
+                    {portfolio.rows.slice(0,7).map((row,i)=>(
+                      <tr key={i} style={{background:i===0?G.surface3:i%2===0?G.surface2:"transparent"}}>
+                        {row.map((cell,j)=>(
+                          <td key={j} style={{padding:"5px 10px",borderBottom:`1px solid ${G.border}`,color:i===0?G.gold:G.cream,whiteSpace:"nowrap",fontWeight:i===0?600:400}}>
+                            {cell!==null&&cell!==undefined?String(cell):""}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </table>
+                </div>
+              </div>
+            )}
+            {!loading && portfolio?.type==="image" && (
+              <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                <img src={portfolio.previewUrl} alt="Portfolio" style={{width:90,height:72,objectFit:"cover",borderRadius:8,border:`1px solid ${G.goldBorder}`}}/>
+                <div style={{flex:1}}>
+                  <p style={{margin:"0 0 4px",fontSize:13,fontWeight:600,color:G.cream}}>{portfolio.fileName}</p>
+                  <p style={{margin:0,fontSize:11,color:G.muted}}>Image chargée · sera analysée par l'agent</p>
+                </div>
+                <button onClick={()=>setPortfolio(null)} style={{background:"transparent",border:`1px solid ${G.border}`,borderRadius:6,color:G.muted,fontSize:11,padding:"4px 10px",cursor:"pointer",flexShrink:0}}>Retirer</button>
+              </div>
+            )}
+          </div>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv,image/*" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+        </div>
+
+        {error && <p style={{color:"#e57373",fontSize:12,marginBottom:12,padding:"10px 14px",background:"rgba(229,115,115,0.1)",borderRadius:8,border:"1px solid rgba(229,115,115,0.2)"}}>{error}</p>}
+
+        {/* API Key */}
+        <details style={{marginBottom:18}}>
+          <summary style={{fontSize:11,letterSpacing:"0.1em",textTransform:"uppercase",color:G.muted,cursor:"pointer",userSelect:"none",display:"flex",alignItems:"center",gap:6}}>
+            <span>🔑</span> Clé API Anthropic
+          </summary>
+          <div style={{marginTop:10,padding:"14px 16px",background:G.surface,border:`1px solid ${G.border}`,borderRadius:10}}>
+            <p style={{fontSize:11,color:G.muted,marginBottom:10}}>Obligatoire pour utiliser l'agent sur votre site. Obtenez une clé sur console.anthropic.com</p>
+            <div style={{display:"flex",gap:8}}>
+              <input type={showKey?"text":"password"} value={apiKey} onChange={e=>setApiKey(e.target.value)} placeholder="sk-ant-api03-…" style={{flex:1,background:G.surface2,border:`1px solid ${G.border}`,borderRadius:8,color:G.cream,fontSize:12,padding:"9px 12px",outline:"none",fontFamily:G.mono}}/>
+              <button onClick={()=>setShowKey(!showKey)} style={{background:G.surface2,border:`1px solid ${G.border}`,borderRadius:8,color:G.muted,fontSize:11,padding:"0 12px",cursor:"pointer"}}>{showKey?"Cacher":"Voir"}</button>
+            </div>
+          </div>
+        </details>
+
+        <button
+          onClick={()=>onStart({portfolio,sessionName,apiKey})}
+          style={{width:"100%",padding:"14px",background:`linear-gradient(135deg,${G.gold},${G.goldBright})`,border:"none",borderRadius:12,color:"#fff",fontSize:14,fontWeight:700,letterSpacing:"0.08em",cursor:"pointer",fontFamily:G.sans,textTransform:"uppercase"}}
+        >
+          Démarrer la session →
+        </button>
+        <p style={{textAlign:"center",fontSize:11,color:G.muted,marginTop:14,lineHeight:1.6}}>
+          Données traitées localement dans votre navigateur<br/>
+          À titre informatif uniquement · Non-conseil en investissement réglementé
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ── CHAT ── */
+function ChatPage({ session, onBack }) {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const bottomRef = useRef();
+  const inputRef = useRef();
+  const system = buildSystem(session.portfolio);
+  const quick = session.portfolio ? QUICK_PORT : QUICK_NONE;
+
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:"smooth"}); },[messages,loading]);
+
+  const send = async (text) => {
+    const t = text||input.trim();
+    if (!t||loading) return;
+    setInput(""); setError(null);
+    const next = [...messages, {role:"user",content:t}];
+    setMessages(next); setLoading(true);
+    try {
+      const reply = await callClaude({messages:next, system, portfolio:messages.length===0?session.portfolio:null, apiKey:session.apiKey});
+      setMessages([...next, {role:"assistant",content:reply}]);
+    } catch(e){ setError(e.message||"Erreur. Réessayez."); }
+    setLoading(false);
+    setTimeout(()=>inputRef.current?.focus(),50);
+  };
+
+  const renderContent = (text) => text.split("\n").map((line,i)=>{
+    if (!line.trim()) return <div key={i} style={{height:5}}/>;
+    if (/^#{1,3} /.test(line)) return <p key={i} style={{fontWeight:700,color:G.cream,margin:"10px 0 4px",fontSize:13}}>{line.replace(/^#{1,3} /,"")}</p>;
+    if (/^[-•*] /.test(line)) return <div key={i} style={{display:"flex",gap:8,margin:"2px 0"}}><span style={{color:G.gold,flexShrink:0}}>▸</span><span style={{fontSize:13,lineHeight:1.7}}>{line.replace(/^[-•*] /,"")}</span></div>;
+    if (/^\d+\. /.test(line)) { const n=line.match(/^(\d+)\./)[1]; return <div key={i} style={{display:"flex",gap:8,margin:"2px 0"}}><span style={{color:G.gold,flexShrink:0,fontFamily:G.mono,fontSize:11,minWidth:18}}>{n}.</span><span style={{fontSize:13,lineHeight:1.7}}>{line.replace(/^\d+\. /,"")}</span></div>; }
+    return <p key={i} style={{margin:"2px 0",fontSize:13,lineHeight:1.75}}>{line}</p>;
+  });
+
+  return (
+    <div style={{minHeight:"100vh",background:G.bg,display:"flex",flexDirection:"column",fontFamily:G.sans,color:G.cream}}>
+      {/* Header */}
+      <div style={{background:G.surface,borderBottom:`1px solid ${G.border}`,padding:"0 1.5rem",height:56,display:"flex",alignItems:"center",gap:12,flexShrink:0}}>
+        <button onClick={onBack} style={{background:"transparent",border:`1px solid ${G.border}`,borderRadius:8,color:G.muted,fontSize:12,padding:"5px 12px",cursor:"pointer"}}>← Retour</button>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{width:30,height:30,borderRadius:"50%",background:`linear-gradient(135deg,${G.gold},${G.goldBright})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14,color:"#fff",fontFamily:G.serif}}>₣</div>
+          <div>
+            <p style={{margin:0,fontSize:13,fontWeight:600,lineHeight:1}}>{session.sessionName||"Finance Agent"}</p>
+            <p style={{margin:0,fontSize:10,color:G.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>
+              {session.portfolio?(session.portfolio.type==="xls"?`📊 ${session.portfolio.fileName}`:`🖼 ${session.portfolio.fileName}`):"Sans portfolio"}
+            </p>
+          </div>
+        </div>
+        <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center"}}>
+          <div style={{width:6,height:6,borderRadius:"50%",background:"#4caf50"}}/>
+          <span style={{fontSize:10,color:G.muted,letterSpacing:"0.08em",textTransform:"uppercase"}}>Actif</span>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div style={{flex:1,overflowY:"auto",padding:"1.5rem",display:"flex",flexDirection:"column",gap:16,maxWidth:760,margin:"0 auto",width:"100%",boxSizing:"border-box"}}>
+        {messages.length===0 && (
+          <div style={{textAlign:"center",paddingTop:"2rem"}}>
+            <div style={{fontSize:36,marginBottom:10}}>{session.portfolio?.type==="xls"?"📊":session.portfolio?.type==="image"?"🖼️":"💼"}</div>
+            <h2 style={{margin:"0 0 6px",fontSize:17,fontFamily:G.serif,fontWeight:700,color:G.cream}}>{session.portfolio?"Portfolio chargé · Prêt à analyser":"Votre agent est prêt"}</h2>
+            <p style={{margin:"0 0 24px",fontSize:13,color:G.muted}}>{session.portfolio?`${session.portfolio.fileName} · Posez vos questions`:"Posez n'importe quelle question financière"}</p>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:10,textAlign:"left"}}>
+              {quick.map((q,i)=>(
+                <button key={i} onClick={()=>send(q.text)} style={{background:G.surface,border:`1px solid ${G.border}`,borderRadius:10,padding:"12px 14px",display:"flex",alignItems:"flex-start",gap:8,cursor:"pointer",textAlign:"left",transition:"all .12s",color:G.cream,fontSize:12,lineHeight:1.5,fontFamily:G.sans}}
+                  onMouseEnter={e=>{e.currentTarget.style.borderColor=G.goldBorder;e.currentTarget.style.background=G.surface2}}
+                  onMouseLeave={e=>{e.currentTarget.style.borderColor=G.border;e.currentTarget.style.background=G.surface}}>
+                  <span style={{fontSize:16}}>{q.icon}</span>{q.text}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {messages.map((m,i)=>(
+          <div key={i} style={{display:"flex",gap:10,flexDirection:m.role==="user"?"row-reverse":"row",alignItems:"flex-start"}}>
+            <div style={{width:28,height:28,borderRadius:"50%",flexShrink:0,background:m.role==="user"?G.surface2:`linear-gradient(135deg,${G.gold},${G.goldBright})`,border:m.role==="user"?`1px solid ${G.goldBorder}`:"none",display:"flex",alignItems:"center",justifyContent:"center",fontSize:m.role==="user"?11:13,fontFamily:G.serif,color:"#fff",fontWeight:700}}>
+              {m.role==="user"?"U":"₣"}
+            </div>
+            <div style={{maxWidth:"82%",background:m.role==="user"?G.surface2:G.surface,border:`1px solid ${m.role==="user"?G.goldBorder:G.border}`,borderRadius:m.role==="user"?"14px 14px 4px 14px":"14px 14px 14px 4px",padding:"12px 16px",color:m.role==="user"?G.cream:"#ccc8be"}}>
+              {m.role==="user"?<p style={{margin:0,fontSize:13,lineHeight:1.65}}>{m.content}</p>:renderContent(m.content)}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div style={{display:"flex",gap:10,alignItems:"center"}}>
+            <div style={{width:28,height:28,borderRadius:"50%",background:`linear-gradient(135deg,${G.gold},${G.goldBright})`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontFamily:G.serif,color:"#fff",fontWeight:700,flexShrink:0}}>₣</div>
+            <div style={{background:G.surface,border:`1px solid ${G.border}`,borderRadius:"14px 14px 14px 4px",padding:"14px 18px",display:"flex",gap:5}}>
+              {[0,1,2].map(n=><div key={n} style={{width:5,height:5,borderRadius:"50%",background:G.gold,opacity:.5,animation:`dot 1s ease-in-out ${n*.2}s infinite`}}/>)}
+            </div>
+          </div>
+        )}
+        {error && (
+          <div style={{background:"rgba(192,57,43,0.12)",border:"1px solid rgba(192,57,43,0.3)",borderRadius:10,padding:"10px 14px",fontSize:12,color:"#e57373",display:"flex",gap:8,alignItems:"center"}}>
+            <span>⚠</span>{error}
+            <button onClick={()=>setError(null)} style={{marginLeft:"auto",background:"transparent",border:"none",color:"#e57373",cursor:"pointer",fontSize:16}}>×</button>
+          </div>
+        )}
+        <div ref={bottomRef}/>
+      </div>
+
+      {/* Input */}
+      <div style={{borderTop:`1px solid ${G.border}`,padding:"1rem 1.5rem",background:G.surface,flexShrink:0}}>
+        <div style={{maxWidth:760,margin:"0 auto"}}>
+          <div style={{display:"flex",gap:10,background:G.surface2,border:`1px solid ${G.goldBorder}`,borderRadius:12,padding:"8px 10px 8px 16px",alignItems:"flex-end"}}>
+            <textarea ref={inputRef} value={input} onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}}
+              placeholder="Posez votre question financière…" rows={1}
+              style={{flex:1,background:"transparent",border:"none",outline:"none",color:G.cream,fontSize:13,resize:"none",fontFamily:G.sans,lineHeight:1.6,maxHeight:120,overflowY:"auto",paddingTop:4}}/>
+            <button onClick={()=>send()} disabled={!input.trim()||loading}
+              style={{background:input.trim()&&!loading?`linear-gradient(135deg,${G.gold},${G.goldBright})`:G.surface,border:`1px solid ${input.trim()&&!loading?"transparent":G.border}`,borderRadius:8,color:input.trim()&&!loading?"#fff":G.muted,fontSize:11,fontWeight:700,letterSpacing:"0.08em",padding:"8px 16px",cursor:input.trim()&&!loading?"pointer":"not-allowed",whiteSpace:"nowrap",textTransform:"uppercase",fontFamily:G.sans}}>
+              Envoyer ↑
+            </button>
+          </div>
+          <p style={{textAlign:"center",fontSize:10,color:G.muted,marginTop:8,letterSpacing:"0.06em"}}>À titre informatif · Non-conseil en investissement réglementé</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── ROOT ── */
+function App() {
+  const [session, setSession] = useState(null);
+  if (!session) return <SetupPage onStart={setSession}/>;
+  return <ChatPage session={session} onBack={()=>setSession(null)}/>;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
